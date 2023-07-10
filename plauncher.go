@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"strings"
 
 	"github.com/andygrunwald/vdf"
 )
 
 type game struct {
-	id         string
-	libpath    string
-	name       string
-	compatpath string
+	id                string
+	libpath           string
+	name              string
+	compatpath        string
+	installfoldername string
 }
 
 type steaminstance struct {
@@ -22,7 +27,6 @@ type steaminstance struct {
 
 // protonrunable will be formated into the needed string by using the following spec:
 type protonrunable struct {
-	envargs                      string //i.e.: PROTON_ENABLE_NVAPI=1 VKD3D_CONFIG=dxr PROTON_ENABLE_NVAPI=1 VKD3D_CONFIG=dxr
 	steamcompatclientinstallpath string //i.e.: ~/.steam/root
 	steamcompatdatapath          string //i.e.: /home/inventorx/Hardspace.Shipbreaker.v1.3.0/Hardspace.Shipbreaker.v1.3.0
 	protonpath                   string //i.e.: /home/inventorx/.steam/steam/steamapps/common/Proton - Experimental/proton
@@ -30,8 +34,35 @@ type protonrunable struct {
 	exeargs                      string //i.e.: -no-splash
 }
 
+type proton struct {
+	id                string
+	libpath           string
+	name              string
+	installfoldername string
+}
+
 func (p protonrunable) ConvertToCall() string {
-	return fmt.Sprintf("%s STEAM_COMPAT_CLIENT_INSTALL_PATH=\"%s\" STEAM_COMPAT_DATA_PATH=\"%s\" %s run \"%s\" %s", p.envargs, p.steamcompatclientinstallpath, p.steamcompatdatapath, p.protonpath, p.exepath, p.exeargs)
+	return fmt.Sprintf("STEAM_COMPAT_CLIENT_INSTALL_PATH=\"%s\" STEAM_COMPAT_DATA_PATH=\"%s\" %s run \"%s\" %s", p.steamcompatclientinstallpath, p.steamcompatdatapath, p.protonpath, p.exepath, p.exeargs)
+}
+
+func MakeProtonRunable(s steaminstance, compatpath string, protonu proton, exepath string, exeargs string) protonrunable {
+	//envargs done
+	steamcompatclientinstallpath := s.install
+	steamcompatdatapath := ""
+	if compatpath == "" {
+		b, _ := os.UserHomeDir()
+		path := b + "/.plauncher/default"
+		err := os.MkdirAll(path, os.ModePerm)
+		if err != nil {
+			panic(err)
+		}
+		steamcompatdatapath = path
+	}
+	protonpath := protonu.installfoldername
+	//exepath done
+	//exeargs done
+	p := protonrunable{steamcompatclientinstallpath: steamcompatclientinstallpath, steamcompatdatapath: steamcompatdatapath, protonpath: protonpath, exepath: exepath, exeargs: exeargs}
+	return p
 }
 
 func GetMapFrom(source map[string]interface{}, key string) map[string]interface{} {
@@ -55,7 +86,6 @@ func GetValFrom(source map[string]interface{}, key string) (value string, e erro
 
 func GetNameFromId(id string, path string) (string, error) {
 	filepath := path + "/steamapps/appmanifest_" + id + ".acf"
-
 	f, err := os.Open(filepath)
 	if err != nil {
 		return "", errors.New("FileRead Err")
@@ -70,6 +100,29 @@ func GetNameFromId(id string, path string) (string, error) {
 	}
 
 	name, err := GetValFrom(GetMapFrom(m, "AppState"), "name")
+	if err != nil {
+		panic(err)
+	}
+	return name, nil
+
+}
+func GetInstallNameFromId(id string, path string) (string, error) {
+	filepath := path + "/steamapps/appmanifest_" + id + ".acf"
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		return "", errors.New("FileRead Err")
+	}
+	defer f.Close()
+
+	p := vdf.NewParser(f)
+	m, err := p.Parse()
+	if err != nil {
+		panic(err)
+
+	}
+
+	name, err := GetValFrom(GetMapFrom(m, "AppState"), "installdir")
 	if err != nil {
 		panic(err)
 	}
@@ -101,6 +154,14 @@ func IsGameWindows(id string, path string) (bool, error) {
 
 }
 
+func IsGameProton(name string) bool {
+	if strings.Contains(name, "Proton") {
+		return true
+	} else {
+		return false
+	}
+}
+
 // func GetCompatDataPathForGame(g game, i steaminstance) string {
 
 // }
@@ -110,14 +171,17 @@ func (g game) GetRunCommand(steam steaminstance, exefile string) string {
 	return Steamclientstring
 }
 
-func GetSteamGameList() []game {
+func GetSteamGameList(s steaminstance) ([]game, []proton) {
 	var gamelist []game
+	var protonlist []proton
 	fmt.Println("test")
 	dirname, err := os.UserHomeDir()
 	if err != nil {
 		panic(err)
 	}
 	fpath := dirname + "/.steam/steam/steamapps/libraryfolders.vdf"
+	fpath = s.install + "/steamapps/libraryfolders.vdf"
+	fmt.Println(fpath)
 	f, err := os.Open(fpath)
 	if err != nil {
 		panic(err)
@@ -137,20 +201,37 @@ func GetSteamGameList() []game {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println(location)
 
 		currentlibrary_applist := GetMapFrom(currentlibrary, "apps")
 
 		for g, _ := range currentlibrary_applist {
 			gameid := g
-			gamelocation := location
-			gamename, err := GetNameFromId(gameid, gamelocation)
+			gamelib := location
+			gamename, err := GetNameFromId(gameid, gamelib)
+			if err != nil {
+				if err.Error() != "FileRead Err" {
+					panic(err)
+				} else {
+					fmt.Println("Missing Library @ " + location + " @ Lookup of " + gameid)
+				}
+			}
 			compatpath := location + "/steamapps/compatdata/" + string(gameid)
+			installpathdir, err := GetInstallNameFromId(gameid, gamelib)
+			installpath := location + "/steamapps/common/" + installpathdir
 			if err == nil {
-				e, _ := IsGameWindows(gameid, gamelocation)
+				e, _ := IsGameWindows(gameid, gamelib)
 				if e {
-					gamelist = append(gamelist, game{gameid, gamelocation, gamename, compatpath})
+					gamelist = append(gamelist, game{gameid, gamelib, gamename, compatpath, installpath})
 
+				} else if IsGameProton(gamename) {
+					protonlist = append(protonlist, proton{gameid, gamelib, gamename, installpath})
+				}
+
+			} else {
+				if err.Error() != "FileRead Err" {
+					panic(err)
+				} else {
+					fmt.Println("Missing Library @ " + location + " @ Lookup of " + gameid)
 				}
 
 			}
@@ -159,11 +240,33 @@ func GetSteamGameList() []game {
 
 	}
 
-	return gamelist
+	return gamelist, protonlist
 }
 
+// func GetListOfProtons
+
 func main() {
-	a := GetSteamGameList()
+	b, _ := os.UserHomeDir()
+	i := steaminstance{install: (b + "/.steam/steam/")}
+	a, p := GetSteamGameList(i)
+
 	//fmt.Println(a)
 	BetterPrintGameList(a)
+	BetterPrintProtonList(p)
+	protonid := 0
+	for id, k := range p {
+		if k.name == "Proton Experimental" {
+			protonid = id
+		}
+	}
+	e := exec.Command("bash", "-c", "echo $sneed")
+	var stdBuffer bytes.Buffer
+	mw := io.MultiWriter(os.Stdout, &stdBuffer)
+	e.Env = os.Environ()
+	e.Stdout = mw
+	e.Stderr = mw
+	e.Run()
+	ex := MakeProtonRunable(i, "", p[protonid], "~/h.exe", "")
+	fmt.Println(ex)
+	fmt.Println(ex.ConvertToCall())
 }
